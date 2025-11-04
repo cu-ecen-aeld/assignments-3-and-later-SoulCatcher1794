@@ -7,4 +7,3 @@ Configured with: /data/jenkins/workspace/GNU-toolchain/arm-13/src/gcc/configure 
 Thread model: posix
 Supported LTO compression algorithms: zlib
 gcc version 13.3.1 20240614 (Arm GNU Toolchain 13.3.Rel1 (Build arm-13.24)) 
-writer: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, with debug_info, not stripped
