@@ -7,16 +7,26 @@
  *   either in invocation of the system() call, or if a non-zero return
  *   value was returned by the command issued in @param cmd.
 */
-bool do_system(const char *cmd)
-{
+bool do_system(const char *cmd){
+    /*
+    * TODO  add your code here
+    *  Call the system() function with the command set in the cmd
+    *   and return a boolean true if the system() call completed with success
+    *   or false() if it returned a failure
+    */
+    int ret, err;
+    ret = system(cmd);
+    openlog(NULL, 0, LOG_USER);
 
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
+    if(ret == -1){
+        err = errno;
+        syslog(LOG_ERR, "System function failed: %s", strerror(err));
+        closelog();
+        return false;
+    }
 
+    syslog(LOG_DEBUG, "System function call completed with success");
+    closelog();
     return true;
 }
 
@@ -33,21 +43,16 @@ bool do_system(const char *cmd)
 *   fork, waitpid, or execv() command, or if a non-zero return value was returned
 *   by the command issued in @param arguments with the specified arguments.
 */
-
-bool do_exec(int count, ...)
-{
+bool do_exec(int count, ...){
     va_list args;
     va_start(args, count);
     char * command[count+1];
     int i;
-    for(i=0; i<count; i++)
-    {
+
+    for(i=0; i<count; i++){
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
 /*
  * TODO:
@@ -58,10 +63,51 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
-
     va_end(args);
+    openlog(NULL, 0, LOG_USER);
 
-    return true;
+    if(command[0][0] != '/'){
+            syslog(LOG_ERR, "Absolute path was not provided for command: %s", command[0]);
+            closelog();
+            return false;
+    }
+
+    for (i=1; i<count; i++){
+        if(command[i][0] != '-' && command[i][0] != '/'){
+            syslog(LOG_ERR, "Absolute path was not provided for file or command: %s", command[i]);
+            closelog();
+            return false;
+        }
+    }
+
+    int status, err;
+    pid_t pid;
+
+    pid = fork();
+    if(pid == -1){
+        err = errno;
+        syslog(LOG_ERR, "Creation of new process failed: %s", strerror(err));
+        return false;
+    }else if (pid == 0){
+        syslog(LOG_DEBUG, "Command %s to be executed at child process %d", command[0], getpid());
+        execv(command[0], command);
+        exit(-1); // Error handle for execv not being able to execute command
+    }
+
+    if(waitpid(pid, &status, 0) == -1){
+        err = errno;
+        syslog(LOG_ERR, "Child process %d could not be terminated: %s", pid, strerror(err));
+        closelog();
+        return false;
+    }else if (WIFEXITED(status)){
+        syslog(LOG_DEBUG, "Child process %d terminated normally", pid);
+        closelog();
+        return true;
+    }else{
+        syslog(LOG_DEBUG, "Child process %d terminated in an unexpected way", pid);
+        closelog();
+        return false;
+    }
 }
 
 /**
@@ -80,10 +126,6 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
 
 /*
  * TODO
@@ -92,8 +134,70 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
-
     va_end(args);
+    openlog(NULL, 0, LOG_USER);
 
-    return true;
+    if(command[0][0] != '/'){
+            syslog(LOG_ERR, "Absolute path was not provided for command: %s", command[0]);
+            closelog();
+            return false;
+    }
+
+    syslog(LOG_DEBUG, "Output file: %s", outputfile);
+
+    int status, err;
+    pid_t pid;
+
+    // Opening output file where output of executed command will be redirected to
+    int fd = open(outputfile, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd == -1){
+        err = errno;
+        syslog(LOG_ERR, "File %s failed to be opened: %s", outputfile, strerror(err));
+        closelog();
+        return false;
+    }
+
+    syslog(LOG_ERR, "Parent pid %d opened file descriptor %d", getpid(), fd);
+
+    // Creating new process
+    pid = fork();
+    // If creation of child process fails, throw error message
+    if(pid == -1){
+        err = errno;
+        syslog(LOG_ERR, "Creation of new process failed: %s", strerror(err));
+        closelog();
+        return false;
+    // If child process is running, execute command provided
+    }else if (pid == 0){
+        // If duplicate file descriptor fails to be created, throw error
+        if(dup2(fd, STDOUT_FILENO) == -1){
+            err = errno;
+            syslog(LOG_ERR, "Creation of duplicate file descriptor failed: %s", strerror(err));
+            exit(-1);
+        }
+
+        close(fd);
+        syslog(LOG_DEBUG, "Command %s to be executed at child process %d with file descriptor %d", command[0], getpid(), fd);
+        execv(command[0], command);
+        err = errno;
+        syslog(LOG_ERR, "Execution of command failed: %s", strerror(err));
+        exit(-1); // Error handle for execv not being able to execute command
+    }
+    
+    close(fd);
+
+    if(waitpid(pid, &status, 0) == -1){
+        err = errno;
+        syslog(LOG_ERR, "Child process %d could not be terminated: %s", pid, strerror(err));
+        closelog();
+        return false;
+    }else if (WIFEXITED(status)){
+        syslog(LOG_DEBUG, "Child process %d terminated normally", pid);
+        closelog();
+        return true;
+    }else{
+        syslog(LOG_DEBUG, "Child process %d terminated in an unexpected way", pid);
+        closelog();
+        return false;
+    }
 }
