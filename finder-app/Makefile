@@ -7,6 +7,8 @@ else
 	CC := gcc
 endif
 
+all: default
+
 default: $(TARGET)
 
 $(TARGET): $(TARGET).c
