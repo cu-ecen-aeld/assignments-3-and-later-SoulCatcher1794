@@ -1,0 +1,23 @@
+1. Create a socket based program with name aesdsocket in the “server” directory which:
+
+    a. Is compiled by the “all” and “default” target of a Makefile in the “server” directory and supports cross compilation, placing the executable file in the “server” directory and named aesdsocket.
+    b. Opens a stream socket bound to port 9000, failing and returning -1 if any of the socket connection steps fail.
+    c. Listens for and accepts a connection
+    d. Logs message to the syslog “Accepted connection from xxx” where XXXX is the IP address of the connected client. 
+    
+2. Receives data over the connection and appends to file /var/tmp/aesdsocketdata, creating this file if it doesn’t exist.
+
+    a.Your implementation should use a newline to separate data packets received.  In other words a packet is considered complete when a newline character is found in the input receive stream, and each newline should result in an append to the /var/tmp/aesdsocketdata file.
+    b.You may assume the data stream does not include null characters (therefore can be processed using string handling functions).
+    c.You may assume the length of the packet will be shorter than the available heap size.  In other words, as long as you handle malloc() associated failures with error messages you may discard associated over-length packets.
+
+3. Returns the full content of /var/tmp/aesdsocketdata to the client as soon as the received data packet completes.
+
+    a.You may assume the total size of all packets sent (and therefore size of /var/tmp/aesdsocketdata) will be less than the size of the root filesystem, however you may not assume this total size of all packets sent will be less than the size of the available RAM for the process heap.
+    b.Logs message to the syslog “Closed connection from XXX” where XXX is the IP address of the connected client.
+    c.Restarts accepting connections from new clients forever in a loop until SIGINT or SIGTERM is received (see below).
+
+4. Gracefully exits when SIGINT or SIGTERM is received, completing any open connection operations, closing any open sockets, and deleting the file /var/tmp/aesdsocketdata.
+    a.Logs message to the syslog “Caught signal, exiting” when SIGINT or SIGTERM is received.
+
+5. Support a '-d' argument which runs the aesdsocket application as a daemon. When in daemon mode the program should fork after ensuring it can bind to port 9000.

@@ -10,7 +10,6 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -22,7 +21,7 @@ static void signal_handler(int sig){
     syslog(LOG_DEBUG, "Caught signal, exiting");
 }
 
-int main(int argc, char* argv[]){
+int setup_server_socket(void){
     int server_fd, status, err;
     int optval = 1;
     struct addrinfo hints, *server_addr;
@@ -38,7 +37,6 @@ int main(int argc, char* argv[]){
     // Creation of address info structure using local communication on port defined
     if( (status = getaddrinfo(NULL, "9000", &hints, &server_addr)) != 0 ){
         syslog(LOG_ERR, "Creation of addrinfo structure failed: %s\n", gai_strerror(status));
-        closelog();
         return -1;
     }
     
@@ -47,7 +45,6 @@ int main(int argc, char* argv[]){
         err = errno;
         syslog(LOG_ERR, "Socket creation failed: %s\n", strerror(err));
         freeaddrinfo(server_addr);
-        closelog();
         return -1;
     }
 
@@ -57,7 +54,6 @@ int main(int argc, char* argv[]){
         syslog(LOG_ERR, "Socket reuse setup failed: %s\n", strerror(err));
         freeaddrinfo(server_addr);
         close(server_fd);
-        closelog();
         return -1;
     }
 
@@ -67,12 +63,110 @@ int main(int argc, char* argv[]){
         syslog(LOG_ERR, "Socket-port binding failed: %s\n", strerror(err));
         freeaddrinfo(server_addr);
         close(server_fd);
-        closelog();
         return -1;
     }
 
     // Free server_addr struct now that is no longer needed
     freeaddrinfo(server_addr);
+    return server_fd;
+}
+
+int client_handler(int server_fd){
+    int client_fd, err;
+    struct sockaddr_storage client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    char client_ip[INET6_ADDRSTRLEN];
+
+    int bytes_received;
+
+    // Accept incoming connection
+    if( (client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1 ){
+        err = errno;
+        syslog(LOG_ERR, "Incoming communication failed: %s\n", strerror(err));
+        close(server_fd);
+        return -1;
+    }
+
+    // Get client information and print client IP once connection is stablished
+    if(client_addr.ss_family == AF_INET){
+        struct sockaddr_in *s = (struct sockaddr_in *)&client_addr;
+        inet_ntop(AF_INET, &s->sin_addr, client_ip, sizeof(client_ip));
+    }else{
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&client_addr;
+        inet_ntop(AF_INET6, &s->sin6_addr, client_ip, sizeof(client_ip));
+    }
+    syslog(LOG_DEBUG, "Accepted connection from %s", client_ip);
+    return client_fd;
+}
+
+char *receive_packet(int client_fd){
+    // Define variables for data packet buffer
+    int err;
+    char *buf = malloc(1024);
+    int buf_size = 1024; //Start with 1kb for buffer size
+    int buf_len = 0;
+    int bytes_received;
+    char *newline_pos = NULL;
+
+    if(buf == NULL){
+        err = errno;
+        syslog(LOG_ERR, "Memory allocation failed: %s\n", strerror(err));
+        return NULL;
+    }
+
+    // Keep receiving data until packet has been fully received
+    while( active && ( (bytes_received = recv(client_fd, (buf+buf_len), (buf_size-buf_len-1), 0)) > 0 ) ){
+        // Throw error if data transfer fails
+        if(bytes_received  == -1){
+            err = errno;
+            syslog(LOG_ERR, "Data transfer failed: %s\n", strerror(err));
+            free(buf);
+            return NULL;
+        }
+
+        // If client finalized connection, send back what has been received so far
+        if(bytes_received == 0){
+            syslog(LOG_DEBUG, "Client finalized connection\n");
+            return buf;
+        }
+
+        buf_len += bytes_received; // Add bytes read to total buffer length
+        buf[buf_len] = '\0'; // End buffer with the null character
+        newline_pos = strchr(buf, '\n'); // Get position where newline character is located
+
+        // Increse buffer size if needed
+        if( buf_len >= (buf_size-1) ){
+            buf_size *= 2; //Duplicate buffer size
+            char *temp = realloc(buf, buf_size); // Reallocate buffer variable with new buffer size
+            
+            // Error handling for memory reallocation
+            if(temp == NULL){
+                err = errno;
+                syslog(LOG_ERR, "Memory reallocation failed: %s\n", strerror(err));
+                free(buf);
+                return -1; 
+            }
+
+            buf = temp;
+        }
+        
+        // If newline character is found, end data transfer
+        if(newline_pos != NULL){
+            return buf;
+        }
+    }
+}
+
+int main(int argc, char* argv[]){
+    int server_fd, err;
+    char *output_file = "/var/tmp/aesdsocketdata";
+
+    // Setup server socket
+    server_fd = setup_server_socket();
+    if(server_fd == -1){
+        closelog();
+        return -1;
+    }
 
     // Catching signals and providing special handling for terminations and interrupts
     struct sigaction action;
@@ -81,14 +175,18 @@ int main(int argc, char* argv[]){
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
 
-    // If argumnet '-d' is provided to program, create connection as a daemon
+    // If argumnet '-d' is provided to program, listen for connections as a daemon
     if (argv[1] == '-d'){
         pid_t pid;
         pid = fork();
-        if(pid < 0){
+        if(pid ==  -1){
+            err = errno;
+            syslog(LOG_ERR, "Daemon process fork failed: %s\n", strerror(err));
             exit(EXIT_FAILURE);
         }else if (pid == 0){
             exit(EXIT_SUCCESS);
+        }else{
+            syslog(LOG_DEBUG, "Running as daemon process");
         }
     }
 
@@ -103,112 +201,24 @@ int main(int argc, char* argv[]){
 
     // Start requesting connection request until signal is detected
     while(active){
-        int client_fd, file_fd;
-        struct sockaddr_storage client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        char client_ip[INET6_ADDRSTRLEN];
-        char *output_file = "/var/tmp/aesdsocketdata";
-        int bytes_received;
-
-        // Accept incoming connection
-        if( (client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1 ){
-            err = errno;
-            syslog(LOG_ERR, "Incoming communication failed: %s\n", strerror(err));
+        // Setting up client connection
+        int client_fd = client_handler(server_fd);
+        if(client_fd == -1){
             close(server_fd);
-            closelog();
-            return -1;
-        }
-
-        // Get client information and print client IP once connection is stablished
-        if(client_addr.ss_family == AF_INET){
-            struct sockaddr_in *s = (struct sockaddr_in *)&client_addr;
-            inet_ntop(AF_INET, &s->sin_addr, client_ip, sizeof(client_ip));
-        }else{
-            struct sockaddr_in6 *s = (struct sockaddr_in6 *)&client_addr;
-            inet_ntop(AF_INET6, &s->sin6_addr, client_ip, sizeof(client_ip));
-        }
-        syslog(LOG_DEBUG, "Accepted connection from %s", client_ip);
-
-        // Open file and create it if it doesn't exist
-        file_fd = open(output_file, O_RDWR | O_APPEND | O_CREAT, 0644);
-        if(file_fd == -1){
-            err = errno;
-            syslog(LOG_ERR, "Failure while opening file: %s\n", strerror(err));
-            close(server_fd);
-            close(client_fd);
             closelog();
             return -1;
         }
         
-        // Allocate memory for buffer 
-        char *buf = malloc(1024);
+        // Receive data packets from client
+        char *buf = receive_packet(client_fd);
         if(buf == NULL){
-           err = errno;
-           syslog(LOG_ERR, "Memory allocation failed: %s\n", strerror(err));
-           close(server_fd);
-           close(client_fd);
-           close(file_fd);
-           closelog();
-           return -1;
-        }
-
-        // Define variables for data packet buffer
-        int buf_size = 1024; //Start with 1kb for buffer size
-        int buf_len = 0;
-        int bytes_received;
-        char *newline_pos = NULL;
-
-        // Keep receiving data packets until there's no more data to be received
-        while( active && (bytes_received = recv(client_fd, buf+buf_len, buf_size-buf_len-1, 0)) > 0 ){
-            
-            buf_len += bytes_received; // Add bytes read to total buffer length
-            buf[buf_len] = '\0'; // End buffer with the null character
-            newline_pos = strchr(buf, '\n'); // Get position where newline character is located
-
-            // Increse buffer size if needed
-            if(buf_len >= buf_size -1){
-                buf_size *= 2; //Duplicate buffer size
-                char *temp = realloc(buf, buf_size); // Reallocate buffer variable with new buffer size
-                if(temp == NULL){
-                    err = errno;
-                    syslog(LOG_ERR, "Memory reallocation failed: %s\n", strerror(err));
-                    free(buf);
-                    close(server_fd);
-                    close(client_fd);
-                    close(file_fd);
-                    closelog();
-                    return -1; 
-                }
-                buf = temp;
-            }
-            
-            
-            // If newline character is found, end data transfer
-            if(newline_pos != NULL){
-                break;
-            }
-
-   
-        }
-
-        // Throw error if data transfer fails
-        if(bytes_received  == -1){
-            err = errno;
-            syslog(LOG_ERR, "Data transfer failed: %s\n", strerror(err));
-            free(buf);
-            close(file_fd);
-            close(client_fd);
             close(server_fd);
+            close(client_fd);
             closelog();
             return -1;
-        }else if(bytes_received == 0){
-            syslog(LOG_DEBUG, "Client finalized connection\n");
-            free(buf);
-            close(client_fd);
-            close(file_fd);
-            continue;
         }
-
+        // Append received data to output file
+        int file_fd = open(output_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
         // Free buffer memory and prepare for new connection
         free(buf);
         close(file_fd);
