@@ -17,7 +17,7 @@
 #define PORT "9000"
 #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
 
-static volatile int active = 1;
+static volatile sigatomic_t active = 1;
 
 static void signal_handler(int sig){
     syslog(LOG_DEBUG, "Caught signal, exiting");
@@ -72,33 +72,31 @@ int setup_server(void){
     return server_fd;
 }
 
-int client_handler(int server_fd){
+int client_handler(int server_fd, char *client_ip_out){
     int client_fd, err;
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
-    char client_ip[INET6_ADDRSTRLEN];
 
     // Accept incoming connection
     if( (client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1 ){
         err = errno;
         syslog(LOG_ERR, "Incoming communication failed: %s\n", strerror(err));
-        close(server_fd);
         return -1;
     }
 
     // Get client information and print client IP once connection is stablished
     if(client_addr.ss_family == AF_INET){
         struct sockaddr_in *s = (struct sockaddr_in *)&client_addr;
-        inet_ntop(AF_INET, &s->sin_addr, client_ip, sizeof(client_ip));
+        inet_ntop(AF_INET, &s->sin_addr, client_ip_out, INET6_ADDRSTRLEN);
     }else{
         struct sockaddr_in6 *s = (struct sockaddr_in6 *)&client_addr;
-        inet_ntop(AF_INET6, &s->sin6_addr, client_ip, sizeof(client_ip));
+        inet_ntop(AF_INET6, &s->sin6_addr, client_ip_out, INET6_ADDRSTRLEN);
     }
-    syslog(LOG_DEBUG, "Accepted connection from %s", client_ip);
+    syslog(LOG_DEBUG, "Accepted connection from %s", client_ip_out);
     return client_fd;
 }
 
-char *receive_data(int client_fd){
+int receive_data(int client_fd, int file_fd){
     // Define variables for data packet buffer
     int err;
     int buf_size = 1024; //Start with 1kb for buffer size
@@ -106,36 +104,59 @@ char *receive_data(int client_fd){
     int buf_len = 0;
     int bytes_received;
     char *newline_pos = NULL;
+    int packet_complete = 0;
+    int written_so_far = 0; // Track how much we've already written
 
     if(buf == NULL){
         err = errno;
         syslog(LOG_ERR, "Memory allocation failed: %s\n", strerror(err));
-        return NULL;
+        return -1;
     }
 
     // Keep receiving data until packet has been fully received
-    while( active && ( (bytes_received = recv(client_fd, (buf+buf_len), (buf_size-buf_len-1), 0)) > 0 ) ){
-        // Throw error if data transfer fails
-        if(bytes_received  == -1){
-            err = errno;
-            syslog(LOG_ERR, "Data transfer failed: %s\n", strerror(err));
-            free(buf);
-            return NULL;
-        }
-
-        // If client finalized connection, send back what has been received so far
-        if(bytes_received == 0){
-            syslog(LOG_DEBUG, "Client finalized connection\n");
-            return buf;
-        }
-
+    while( active && !packet_complete && ((bytes_received = recv(client_fd, (buf+buf_len), (buf_size-buf_len-1), 0)) > 0) ){
         buf_len += bytes_received; // Add bytes read to total buffer length
         buf[buf_len] = '\0'; // End buffer with the null character
-        newline_pos = strchr(buf, '\n'); // Get position where newline character is located
+        
+        // Check if we have a complete packet (newline found)
+        newline_pos = strchr(buf + written_so_far, '\n'); // Search from where we left off
+        if(newline_pos != NULL){
+            packet_complete = 1;
+            // Write only the remaining data up to and including the newline
+            int remaining_to_write = (newline_pos - (buf + written_so_far)) + 1;
+            int bytes_written = 0;
+            
+            while(bytes_written < remaining_to_write){
+                int result = write(file_fd, (buf + written_so_far) + bytes_written, remaining_to_write - bytes_written);
+                if(result == -1){
+                    err = errno;
+                    syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
+                    free(buf);
+                    return -1;
+                }
+                bytes_written += result;
+            }
+        } else {
+            // Write only the new data we haven't written yet
+            int new_data_len = buf_len - written_so_far;
+            int bytes_written = 0;
+            
+            while(bytes_written < new_data_len){
+                int result = write(file_fd, (buf + written_so_far) + bytes_written, new_data_len - bytes_written);
+                if(result == -1){
+                    err = errno;
+                    syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
+                    free(buf);
+                    return -1;
+                }
+                bytes_written += result;
+            }
+            written_so_far = buf_len; // Update what we've written
+        }
 
-        // Increse buffer size if needed
-        if( buf_len >= (buf_size-1) ){
-            buf_size *= 2; //Duplicate buffer size
+        // Increase buffer size if needed and no packet complete yet
+        if( !packet_complete && buf_len >= (buf_size-1) ){
+            buf_size *= 2; //Double buffer size
             char *temp = realloc(buf, buf_size); // Reallocate buffer variable with new buffer size
             
             // Error handling for memory reallocation
@@ -143,45 +164,47 @@ char *receive_data(int client_fd){
                 err = errno;
                 syslog(LOG_ERR, "Memory reallocation failed: %s\n", strerror(err));
                 free(buf);
-                return NULL; 
+                return -1; 
             }
             buf = temp;
         }
-        
-        // If newline character is found, end data transfer
-        if(newline_pos != NULL){
-            return buf;
+    }
+
+    // Handle receive errors
+    if(bytes_received == -1){
+        err = errno;
+        syslog(LOG_ERR, "Data transfer failed: %s\n", strerror(err));
+        free(buf);
+        return -1;
+    }
+
+    // If client closed connection before sending complete packet
+    if(bytes_received == 0 && !packet_complete){
+        syslog(LOG_DEBUG, "Client closed connection before sending complete packet\n");
+        // Write any remaining data to file
+        if(buf_len > 0){
+            int bytes_written = 0;
+            while(bytes_written < buf_len){
+                int result = write(file_fd, buf + bytes_written, buf_len - bytes_written);
+                if(result == -1){
+                    err = errno;
+                    syslog(LOG_ERR, "Writing remaining data to file failed: %s\n", strerror(err));
+                    free(buf);
+                    return -1;
+                }
+                bytes_written += result;
+            }
         }
     }
-    return buf;
-}
 
-int write_to_file(int file_fd, char *buf){
-    int bytes_written = 0;
-    int total_bytes = strlen(buf);
-    int err;
-
-    // Write entire buffer to file
-    while(bytes_written < total_bytes){
-        int result = write(file_fd, buf + bytes_written, total_bytes - bytes_written);
-        if(result == -1){
-            err = errno;
-            syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
-            return -1;
-        }
-        bytes_written += result;
-    }
+    free(buf);
     return 0;
 }
 
-int send_data(int client_fd, int file_fd, int buf_size){
+int send_data(int client_fd, int file_fd){
     int err, bytes_read, bytes_sent;
-    int len = buf_size;
-    char *buf = malloc(len);
-
-    // Initialize bytes counters
-    bytes_sent = 0;
-    bytes_read = 0;
+    int buf_size = 1024;
+    char *buf = malloc(buf_size);
 
     // Error handling for memory allocation
     if(buf == NULL){
@@ -190,23 +213,18 @@ int send_data(int client_fd, int file_fd, int buf_size){
         return -1;
     }
 
-    // Read data from file
-    while( (bytes_read = read(file_fd, buf, len)) != 0 ){
-        if(bytes_read == -1){
-            err = errno;
-            if(err == EINTR){
-                continue; // Retry read operation if interrupted by signal
-            }
-            syslog(LOG_ERR, "Reading from file failed: %s\n", strerror(err));
-            free(buf);
-            return -1;
-        }
-        len -= bytes_read; // Decrease remaining length to read
-        buf += bytes_read; // Move buffer pointer forward
+    // Seek to beginning of file to read complete content
+    if( (lseek(file_fd, 0, SEEK_SET) == -1) ){
+        err = errno;
+        syslog(LOG_ERR, "File seek failed: %s\n", strerror(err));
+        free(buf);
+        return -1;
     }
-    buf -= (buf_size - len); // Reset buffer pointer to the beginning
 
-    while(bytes_sent < bytes_read){
+    // Read and send data from file in chunks
+    while( (bytes_read = read(file_fd, buf, buf_size)) > 0 ){
+        bytes_sent = 0;
+        while(bytes_sent < bytes_read){
             int result = send(client_fd, buf + bytes_sent, bytes_read - bytes_sent, 0);
             if(result == -1){
                 err = errno;
@@ -215,6 +233,14 @@ int send_data(int client_fd, int file_fd, int buf_size){
                 return -1;
             }
             bytes_sent += result;
+        }
+    }
+
+    if(bytes_read == -1){
+        err = errno;
+        syslog(LOG_ERR, "Reading from file failed: %s\n", strerror(err));
+        free(buf);
+        return -1;
     }
 
     free(buf);
@@ -267,38 +293,29 @@ int main(int argc, char* argv[]){
 
     // Start requesting connection request until signal is detected
     while(active){
-        // Setting up client connection
-        client_fd = client_handler(server_fd);
+        char client_ip[INET6_ADDRSTRLEN];
+
+        // Setting up client connection and return client IP address
+        client_fd = client_handler(server_fd, client_ip);
         if(client_fd == -1){
             close(server_fd);
             closelog();
             return -1;
         }
         
-        // Receive data packets from client
-        char *buf = receive_data(client_fd);
-        if(buf == NULL){
-            close(server_fd);
-            close(client_fd);
-            closelog();
-            return -1;
-        }
-
         // Open output file for writing received data, or create it if it doesn't exist
         file_fd = open(OUTPUT_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if(file_fd == -1){
             err = errno;
             syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
-            free(buf);
             close(server_fd);
             close(client_fd);
             closelog();
             return -1;
         }
 
-        // Write received data to output file
-        if( (write_to_file(file_fd, buf)) == -1 ){
-            free(buf);
+        // Receive data packets from client and write to file immediately
+        if( (receive_data(client_fd, file_fd)) == -1 ){
             close(file_fd);
             close(client_fd);
             close(server_fd);
@@ -307,8 +324,7 @@ int main(int argc, char* argv[]){
         }
 
         // Send back data saved in output file to client
-        if( (send_data(client_fd, file_fd, sizeof(buf))) == -1 ){
-            free(buf);
+        if( (send_data(client_fd, file_fd)) == -1 ){
             close(file_fd);
             close(client_fd);
             close(server_fd);
@@ -316,10 +332,12 @@ int main(int argc, char* argv[]){
             return -1;
         }
 
-        free(buf); // Free buffer memory and prepare for new connection
+        // Log closed connection with client IP
+        syslog(LOG_DEBUG, "Closed connection from %s", client_ip);
         close(file_fd); // Close output file after writing is done
         close(client_fd); // Close client connection after data transfer is done
     }
     close(server_fd);
+    closelog();
     return 0;
 }
