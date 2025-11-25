@@ -14,20 +14,21 @@
 #include <signal.h>
 #include <stdlib.h>
 
+#define PORT "9000"
+#define OUTPUT_FILE "/var/tmp/aesdsocketdata"
+
 static volatile int active = 1;
 
 static void signal_handler(int sig){
-    active = 0;
     syslog(LOG_DEBUG, "Caught signal, exiting");
+    active = 0;
 }
 
-int setup_server_socket(void){
+int setup_server(void){
     int server_fd, status, err;
     int optval = 1;
     struct addrinfo hints, *server_addr;
     
-    openlog(NULL, 0, LOG_USER);
-
     // Initialize addrinfo structure with address information
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; // Either IPv4 or IPv6
@@ -35,7 +36,7 @@ int setup_server_socket(void){
     hints.ai_flags = AI_PASSIVE; // Indicates communication inside the same machine as host
 
     // Creation of address info structure using local communication on port defined
-    if( (status = getaddrinfo(NULL, "9000", &hints, &server_addr)) != 0 ){
+    if( (status = getaddrinfo(NULL, PORT, &hints, &server_addr)) != 0 ){
         syslog(LOG_ERR, "Creation of addrinfo structure failed: %s\n", gai_strerror(status));
         return -1;
     }
@@ -77,8 +78,6 @@ int client_handler(int server_fd){
     socklen_t client_len = sizeof(client_addr);
     char client_ip[INET6_ADDRSTRLEN];
 
-    int bytes_received;
-
     // Accept incoming connection
     if( (client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1 ){
         err = errno;
@@ -99,11 +98,11 @@ int client_handler(int server_fd){
     return client_fd;
 }
 
-char *receive_packet(int client_fd){
+char *receive_data(int client_fd){
     // Define variables for data packet buffer
     int err;
-    char *buf = malloc(1024);
     int buf_size = 1024; //Start with 1kb for buffer size
+    char *buf = malloc(buf_size);
     int buf_len = 0;
     int bytes_received;
     char *newline_pos = NULL;
@@ -144,9 +143,8 @@ char *receive_packet(int client_fd){
                 err = errno;
                 syslog(LOG_ERR, "Memory reallocation failed: %s\n", strerror(err));
                 free(buf);
-                return -1; 
+                return NULL; 
             }
-
             buf = temp;
         }
         
@@ -155,18 +153,77 @@ char *receive_packet(int client_fd){
             return buf;
         }
     }
+    return buf;
+}
+
+int write_to_file(int file_fd, char *buf){
+    int bytes_written = 0;
+    int total_bytes = strlen(buf);
+    int err;
+
+    // Write entire buffer to file
+    while(bytes_written < total_bytes){
+        int result = write(file_fd, buf + bytes_written, total_bytes - bytes_written);
+        if(result == -1){
+            err = errno;
+            syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
+            return -1;
+        }
+        bytes_written += result;
+    }
+    return 0;
+}
+
+int send_data(int client_fd, int file_fd, int buf_size){
+    int err, bytes_read, bytes_sent;
+    int len = buf_size;
+    char *buf = malloc(len);
+
+    // Initialize bytes counters
+    bytes_sent = 0;
+    bytes_read = 0;
+
+    // Error handling for memory allocation
+    if(buf == NULL){
+        err = errno;
+        syslog(LOG_ERR, "Memory allocation failed: %s\n", strerror(err));
+        return -1;
+    }
+
+    // Read data from file
+    while( (bytes_read = read(file_fd, buf, len)) != 0 ){
+        if(bytes_read == -1){
+            err = errno;
+            if(err == EINTR){
+                continue; // Retry read operation if interrupted by signal
+            }
+            syslog(LOG_ERR, "Reading from file failed: %s\n", strerror(err));
+            free(buf);
+            return -1;
+        }
+        len -= bytes_read; // Decrease remaining length to read
+        buf += bytes_read; // Move buffer pointer forward
+    }
+    buf -= (buf_size - len); // Reset buffer pointer to the beginning
+
+    while(bytes_sent < bytes_read){
+            int result = send(client_fd, buf + bytes_sent, bytes_read - bytes_sent, 0);
+            if(result == -1){
+                err = errno;
+                syslog(LOG_ERR, "Sending data to client failed: %s\n", strerror(err));
+                free(buf);
+                return -1;
+            }
+            bytes_sent += result;
+    }
+
+    free(buf);
+    return 0;
 }
 
 int main(int argc, char* argv[]){
-    int server_fd, err;
-    char *output_file = "/var/tmp/aesdsocketdata";
-
-    // Setup server socket
-    server_fd = setup_server_socket();
-    if(server_fd == -1){
-        closelog();
-        return -1;
-    }
+    int server_fd, client_fd, file_fd, err;
+    openlog(NULL, 0, LOG_USER);
 
     // Catching signals and providing special handling for terminations and interrupts
     struct sigaction action;
@@ -175,6 +232,14 @@ int main(int argc, char* argv[]){
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
 
+    // Setup server socket
+    server_fd = setup_server();
+    if(server_fd == -1){
+        closelog();
+        return -1;
+    }
+
+    /*
     // If argumnet '-d' is provided to program, listen for connections as a daemon
     if (argv[1] == '-d'){
         pid_t pid;
@@ -189,6 +254,7 @@ int main(int argc, char* argv[]){
             syslog(LOG_DEBUG, "Running as daemon process");
         }
     }
+    */
 
     // Listen for incoming connections
     if( (listen(server_fd, 10)) == -1 ){
@@ -202,7 +268,7 @@ int main(int argc, char* argv[]){
     // Start requesting connection request until signal is detected
     while(active){
         // Setting up client connection
-        int client_fd = client_handler(server_fd);
+        client_fd = client_handler(server_fd);
         if(client_fd == -1){
             close(server_fd);
             closelog();
@@ -210,21 +276,50 @@ int main(int argc, char* argv[]){
         }
         
         // Receive data packets from client
-        char *buf = receive_packet(client_fd);
+        char *buf = receive_data(client_fd);
         if(buf == NULL){
             close(server_fd);
             close(client_fd);
             closelog();
             return -1;
         }
-        // Append received data to output file
-        int file_fd = open(output_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        // Free buffer memory and prepare for new connection
-        free(buf);
-        close(file_fd);
-        close(client_fd);
-    }
 
+        // Open output file for writing received data, or create it if it doesn't exist
+        file_fd = open(OUTPUT_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if(file_fd == -1){
+            err = errno;
+            syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
+            free(buf);
+            close(server_fd);
+            close(client_fd);
+            closelog();
+            return -1;
+        }
+
+        // Write received data to output file
+        if( (write_to_file(file_fd, buf)) == -1 ){
+            free(buf);
+            close(file_fd);
+            close(client_fd);
+            close(server_fd);
+            closelog();
+            return -1;
+        }
+
+        // Send back data saved in output file to client
+        if( (send_data(client_fd, file_fd, sizeof(buf))) == -1 ){
+            free(buf);
+            close(file_fd);
+            close(client_fd);
+            close(server_fd);
+            closelog();
+            return -1;
+        }
+
+        free(buf); // Free buffer memory and prepare for new connection
+        close(file_fd); // Close output file after writing is done
+        close(client_fd); // Close client connection after data transfer is done
+    }
     close(server_fd);
     return 0;
 }
