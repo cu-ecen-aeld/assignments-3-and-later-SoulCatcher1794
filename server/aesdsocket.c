@@ -17,10 +17,18 @@
 #define PORT "9000"
 #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
 
-static volatile sigatomic_t active = 1;
+static volatile sig_atomic_t active = 1;
 
 static void signal_handler(int sig){
+    int err;
     syslog(LOG_DEBUG, "Caught signal, exiting");
+    // Delete the output file
+    if(unlink(OUTPUT_FILE) == -1){
+        err = errno;
+        if(err != ENOENT){  // Ignore error if file doesn't exist
+            syslog(LOG_ERR, "Failed to delete output file: %s\n", strerror(err));
+        }
+    }
     active = 0;
 }
 
@@ -170,6 +178,8 @@ int receive_data(int client_fd, int file_fd){
         }
     }
 
+    syslog(LOG_DEBUG, "Data reception from client complete");
+
     // Handle receive errors
     if(bytes_received == -1){
         err = errno;
@@ -221,18 +231,20 @@ int send_data(int client_fd, int file_fd){
         return -1;
     }
 
+    bytes_sent = 0;
     // Read and send data from file in chunks
     while( (bytes_read = read(file_fd, buf, buf_size)) > 0 ){
-        bytes_sent = 0;
-        while(bytes_sent < bytes_read){
-            int result = send(client_fd, buf + bytes_sent, bytes_read - bytes_sent, 0);
-            if(result == -1){
+        int total_sent = 0;
+        while(total_sent < bytes_read){
+            int sent = send(client_fd, buf + total_sent, bytes_read - total_sent, 0);
+            if(sent == -1){
                 err = errno;
                 syslog(LOG_ERR, "Sending data to client failed: %s\n", strerror(err));
                 free(buf);
                 return -1;
             }
-            bytes_sent += result;
+            total_sent += sent;
+            bytes_sent += sent;
         }
     }
 
@@ -248,15 +260,22 @@ int send_data(int client_fd, int file_fd){
 }
 
 int main(int argc, char* argv[]){
-    int server_fd, client_fd, file_fd, err;
+    int server_fd, err;
     openlog(NULL, 0, LOG_USER);
 
     // Catching signals and providing special handling for terminations and interrupts
     struct sigaction action;
     memset(&action, 0, sizeof(struct sigaction));
     action.sa_handler = signal_handler;
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
+    sigemptyset(&action.sa_mask);  // Clear signal mask
+    action.sa_flags = 0;            // No special flags
+
+    if(sigaction(SIGINT, &action, NULL) == -1){
+        syslog(LOG_ERR, "Failed to set SIGINT handler");
+    }
+    if(sigaction(SIGTERM, &action, NULL) == -1){
+        syslog(LOG_ERR, "Failed to set SIGTERM handler");
+    }
 
     // Setup server socket
     server_fd = setup_server();
@@ -264,23 +283,43 @@ int main(int argc, char* argv[]){
         closelog();
         return -1;
     }
+    syslog(LOG_DEBUG, "Server socket file descriptor: %d", server_fd);
 
-    /*
     // If argumnet '-d' is provided to program, listen for connections as a daemon
-    if (argv[1] == '-d'){
+    if ( (argc > 1) && (strcmp(argv[1], "-d") == 0)){
         pid_t pid;
+
         pid = fork();
+
         if(pid ==  -1){
             err = errno;
             syslog(LOG_ERR, "Daemon process fork failed: %s\n", strerror(err));
             exit(EXIT_FAILURE);
         }else if (pid == 0){
-            exit(EXIT_SUCCESS);
-        }else{
             syslog(LOG_DEBUG, "Running as daemon process");
+            if( (setsid()) == -1 ){
+                err = errno;
+                syslog(LOG_ERR, "Creating new session for daemon failed: %s\n", strerror(err));
+                close(server_fd);
+                closelog();
+                return -1;
+            }
+
+            if( (chdir("/")) == -1 ){
+                err = errno;
+                syslog(LOG_ERR, "Changing working directory for daemon failed: %s\n", strerror(err));
+                close(server_fd);
+                closelog();
+                return -1;
+            }
+            // Close standard file descriptors
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+        }else if(pid > 0){
+            exit(EXIT_SUCCESS);
         }
     }
-    */
 
     // Listen for incoming connections
     if( (listen(server_fd, 10)) == -1 ){
@@ -290,21 +329,25 @@ int main(int argc, char* argv[]){
         closelog();
         return -1;
     }
+    syslog(LOG_DEBUG, "Server listening for incoming connections");
 
     // Start requesting connection request until signal is detected
     while(active){
+        int client_fd, file_fd;
         char client_ip[INET6_ADDRSTRLEN];
 
         // Setting up client connection and return client IP address
         client_fd = client_handler(server_fd, client_ip);
         if(client_fd == -1){
-            close(server_fd);
-            closelog();
-            return -1;
+            if(!active){
+                break; // Exit loop if signal was caught
+            }
+            continue;
         }
+        syslog(LOG_DEBUG, "Client file descriptor: %d", client_fd);
         
         // Open output file for writing received data, or create it if it doesn't exist
-        file_fd = open(OUTPUT_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
         if(file_fd == -1){
             err = errno;
             syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
@@ -337,7 +380,9 @@ int main(int argc, char* argv[]){
         close(file_fd); // Close output file after writing is done
         close(client_fd); // Close client connection after data transfer is done
     }
+    
     close(server_fd);
+    syslog(LOG_DEBUG, "Server socket closed");
     closelog();
     return 0;
 }
