@@ -20,15 +20,7 @@
 static volatile sig_atomic_t active = 1;
 
 static void signal_handler(int sig){
-    int err;
     syslog(LOG_DEBUG, "Caught signal, exiting");
-    // Delete the output file
-    if(unlink(OUTPUT_FILE) == -1){
-        err = errno;
-        if(err != ENOENT){  // Ignore error if file doesn't exist
-            syslog(LOG_ERR, "Failed to delete output file: %s\n", strerror(err));
-        }
-    }
     active = 0;
 }
 
@@ -88,7 +80,10 @@ int client_handler(int server_fd, char *client_ip_out){
     // Accept incoming connection
     if( (client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1 ){
         err = errno;
-        syslog(LOG_ERR, "Incoming communication failed: %s\n", strerror(err));
+        // Don't log error if interrupted by signal
+        if(err != EINTR){
+            syslog(LOG_ERR, "Incoming communication failed: %s\n", strerror(err));
+        }
         return -1;
     }
 
@@ -383,6 +378,15 @@ int main(int argc, char* argv[]){
     
     close(server_fd);
     syslog(LOG_DEBUG, "Server socket closed");
+
+    // Delete the output file
+    if(unlink(OUTPUT_FILE) == -1){
+        err = errno;
+        if(err != ENOENT){  // Ignore error if file doesn't exist
+            syslog(LOG_ERR, "Failed to delete output file: %s\n", strerror(err));
+        }
+    }
+
     closelog();
     return 0;
 }
