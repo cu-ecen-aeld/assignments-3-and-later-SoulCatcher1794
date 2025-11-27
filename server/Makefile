@@ -1,19 +1,20 @@
-TARGET = aesdsocket
-CFLAGS = -g -Werror -Wall -std=c99
+TARGET=aesdsocket
+CFLAGS=-g -Werror -Wall -std=c99
 
 ifdef CROSS_COMPILE
-    CC := $(CROSS_COMPILE)gcc
+	CC:=$(CROSS_COMPILE)gcc
 else
-    CC := gcc
+	CC:=gcc
 endif
 
-all: default
+all:default
 
-default: $(TARGET)
+default:$(TARGET)
 
 $(TARGET): $(TARGET).c
-    $(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: clean
+.PHONY:clean
+
 clean:
-    rm -f $(TARGET) *.o
+	rm -f $(TARGET) *.o
