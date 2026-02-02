@@ -13,17 +13,39 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <time.h>
+#include "queue.h"
 
 #define PORT "9000"
+#define BACKLOG 10
 #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
 
+// Global variables
 static volatile sig_atomic_t active = 1;
 
+// Mutexes for file and list operations
+static pthread_mutex_t file_mutex;
+static pthread_mutex_t list_mutex;
+
+// Client data structure for thread pool
+struct thread_data{
+    pthread_t thread_id;
+    int thread_complete;
+    int client_fd;
+    SLIST_ENTRY(thread_data) thread_pool;
+};
+
+// Define head for thread pool linked list
+SLIST_HEAD(thread_pool_head, thread_data) head;
+
+// Signal handler for SIGINT and SIGTERM
 static void signal_handler(int sig){
     syslog(LOG_DEBUG, "Caught signal, exiting");
     active = 0;
 }
 
+// Function to setup server socket
 int setup_server(void){
     int server_fd, status, err;
     int optval = 1;
@@ -66,14 +88,17 @@ int setup_server(void){
         close(server_fd);
         return -1;
     }
+    syslog(LOG_DEBUG, "Server socket file descriptor: %d", server_fd);
 
     // Free server_addr struct now that is no longer needed
     freeaddrinfo(server_addr);
     return server_fd;
 }
 
-int client_handler(int server_fd, char *client_ip_out){
+// Function to handle client connection and return client file descriptor
+int client_setup(int server_fd){
     int client_fd, err;
+    char client_ip[INET6_ADDRSTRLEN];
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
 
@@ -90,25 +115,26 @@ int client_handler(int server_fd, char *client_ip_out){
     // Get client information and print client IP once connection is stablished
     if(client_addr.ss_family == AF_INET){
         struct sockaddr_in *s = (struct sockaddr_in *)&client_addr;
-        inet_ntop(AF_INET, &s->sin_addr, client_ip_out, INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET, &s->sin_addr, client_ip, INET6_ADDRSTRLEN);
     }else{
         struct sockaddr_in6 *s = (struct sockaddr_in6 *)&client_addr;
-        inet_ntop(AF_INET6, &s->sin6_addr, client_ip_out, INET6_ADDRSTRLEN);
+        inet_ntop(AF_INET6, &s->sin6_addr, client_ip, INET6_ADDRSTRLEN);
     }
-    syslog(LOG_DEBUG, "Accepted connection from %s", client_ip_out);
+
+    syslog(LOG_DEBUG, "Accepted connection from IP: %s", client_ip);
+    syslog(LOG_DEBUG, "Client file descriptor: %d", client_fd);
     return client_fd;
 }
 
+// Function to receive data from client and write to file
 int receive_data(int client_fd, int file_fd){
     // Define variables for data packet buffer
     int err;
     int buf_size = 1024; //Start with 1kb for buffer size
     char *buf = malloc(buf_size);
-    int buf_len = 0;
+    int packet_size = 0;
     int bytes_received;
     char *newline_pos = NULL;
-    int packet_complete = 0;
-    int written_so_far = 0; // Track how much we've already written
 
     if(buf == NULL){
         err = errno;
@@ -116,49 +142,37 @@ int receive_data(int client_fd, int file_fd){
         return -1;
     }
 
-    // Keep receiving data until packet has been fully received
-    while( active && !packet_complete && ((bytes_received = recv(client_fd, (buf+buf_len), (buf_size-buf_len-1), 0)) > 0) ){
-        buf_len += bytes_received; // Add bytes read to total buffer length
-        buf[buf_len] = '\0'; // End buffer with the null character
+    // Keep receiving data until client closes connection
+    while(active && ((bytes_received = recv(client_fd, (buf+packet_size), (buf_size-packet_size-1), 0)) > 0)){
+        packet_size += bytes_received; // Add bytes read to total packet size
+        buf[packet_size] = '\0'; // End buffer with the null character
         
         // Check if we have a complete packet (newline found)
-        newline_pos = strchr(buf + written_so_far, '\n'); // Search from where we left off
+        newline_pos = strchr(buf, '\n');
+        // Found new line character which indicates a single packet has been completely recieved
         if(newline_pos != NULL){
-            packet_complete = 1;
-            // Write only the remaining data up to and including the newline
-            int remaining_to_write = (newline_pos - (buf + written_so_far)) + 1;
-            int bytes_written = 0;
-            
-            while(bytes_written < remaining_to_write){
-                int result = write(file_fd, (buf + written_so_far) + bytes_written, remaining_to_write - bytes_written);
+            int packet_length = (newline_pos - buf) + 1; // Calculate length of complete packet (buffer size - position of newline + 1 to include newline)
+            int bytes_written = 0; // Track number of bytes written to file
+
+            pthread_mutex_lock(&file_mutex); // Lock file for writing
+            while(bytes_written < packet_length){
+                int result = write(file_fd, (buf + bytes_written), (packet_length - bytes_written));
                 if(result == -1){
                     err = errno;
                     syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
                     free(buf);
-                    return -1;
+                    pthread_mutex_unlock(&file_mutex); // Unlock file after writing attempt
+                    return -1; // Exit with error
                 }
                 bytes_written += result;
             }
-        } else {
-            // Write only the new data we haven't written yet
-            int new_data_len = buf_len - written_so_far;
-            int bytes_written = 0;
-            
-            while(bytes_written < new_data_len){
-                int result = write(file_fd, (buf + written_so_far) + bytes_written, new_data_len - bytes_written);
-                if(result == -1){
-                    err = errno;
-                    syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
-                    free(buf);
-                    return -1;
-                }
-                bytes_written += result;
-            }
-            written_so_far = buf_len; // Update what we've written
-        }
+            free(buf); // Free buffer memory
+            pthread_mutex_unlock(&file_mutex); // Unlock file after writing to file
+            return 0; // Packet fully received and written to file
+        } 
 
         // Increase buffer size if needed and no packet complete yet
-        if( !packet_complete && buf_len >= (buf_size-1) ){
+        if(packet_size >= (buf_size-1)){
             buf_size *= 2; //Double buffer size
             char *temp = realloc(buf, buf_size); // Reallocate buffer variable with new buffer size
             
@@ -173,8 +187,6 @@ int receive_data(int client_fd, int file_fd){
         }
     }
 
-    syslog(LOG_DEBUG, "Data reception from client complete");
-
     // Handle receive errors
     if(bytes_received == -1){
         err = errno;
@@ -183,31 +195,15 @@ int receive_data(int client_fd, int file_fd){
         return -1;
     }
 
-    // If client closed connection before sending complete packet
-    if(bytes_received == 0 && !packet_complete){
-        syslog(LOG_DEBUG, "Client closed connection before sending complete packet\n");
-        // Write any remaining data to file
-        if(buf_len > 0){
-            int bytes_written = 0;
-            while(bytes_written < buf_len){
-                int result = write(file_fd, buf + bytes_written, buf_len - bytes_written);
-                if(result == -1){
-                    err = errno;
-                    syslog(LOG_ERR, "Writing remaining data to file failed: %s\n", strerror(err));
-                    free(buf);
-                    return -1;
-                }
-                bytes_written += result;
-            }
-        }
-    }
-
-    free(buf);
+    // Client closed connection, finalize data reception and 
+    syslog(LOG_DEBUG, "Data reception from client finalized");
+    free(buf); // Free buffer memory of unwritten data of last packet
     return 0;
 }
 
+// Function to send data from file back to client
 int send_data(int client_fd, int file_fd){
-    int err, bytes_read, bytes_sent;
+    int err, bytes_read;
     int buf_size = 1024;
     char *buf = malloc(buf_size);
 
@@ -226,22 +222,24 @@ int send_data(int client_fd, int file_fd){
         return -1;
     }
 
-    bytes_sent = 0;
+    pthread_mutex_lock(&file_mutex); // Lock file for reading
     // Read and send data from file in chunks
     while( (bytes_read = read(file_fd, buf, buf_size)) > 0 ){
         int total_sent = 0;
+        // Send all bytes read from file
         while(total_sent < bytes_read){
             int sent = send(client_fd, buf + total_sent, bytes_read - total_sent, 0);
             if(sent == -1){
                 err = errno;
                 syslog(LOG_ERR, "Sending data to client failed: %s\n", strerror(err));
                 free(buf);
+                pthread_mutex_unlock(&file_mutex); // Unlock file after sending attempt
                 return -1;
             }
             total_sent += sent;
-            bytes_sent += sent;
         }
     }
+    pthread_mutex_unlock(&file_mutex); // Unlock file after reading
 
     if(bytes_read == -1){
         err = errno;
@@ -254,16 +252,109 @@ int send_data(int client_fd, int file_fd){
     return 0;
 }
 
+// Define thread handler function
+void *client_handler(void *args){
+    struct thread_data *data = (struct thread_data *)args;
+    int client_fd = data->client_fd;
+    int file_fd, err;
+
+    // Open output file for writing received data, or create it if it doesn't exist
+    file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if(file_fd == -1){
+        err = errno;
+        syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
+        close(client_fd);
+        pthread_mutex_lock(&list_mutex);
+        data->thread_complete = 1;
+        pthread_mutex_unlock(&list_mutex);
+        pthread_exit(NULL);
+    }
+
+    // Receive data packets from client and write to file immediately
+    if( (receive_data(client_fd, file_fd)) == -1 ){
+        close(client_fd);
+        close(file_fd);
+        pthread_mutex_lock(&list_mutex);
+        data->thread_complete = 1;
+        pthread_mutex_unlock(&list_mutex);
+        pthread_exit(NULL);
+    }
+
+    // Send back data saved in output file to client
+    if( (send_data(client_fd, file_fd)) == -1 ){
+        close(client_fd);
+        close(file_fd);
+        pthread_mutex_lock(&list_mutex);
+        data->thread_complete = 1;
+        pthread_mutex_unlock(&list_mutex);
+        pthread_exit(NULL);
+    }
+
+    close(file_fd); // Close output file after writing is done
+    close(client_fd); // Close client connection after data transfer is done
+
+    pthread_mutex_lock(&list_mutex);
+    data->thread_complete = 1;
+    pthread_mutex_unlock(&list_mutex);
+    return NULL;
+}
+
+void *stamper_handler(void *args){
+    int err;
+
+    while(active){
+        time_t now = time(NULL); // Get current time
+        struct tm *tm_info = localtime(&now); // Convert to local time structure
+        char time_buffer[64]; // Buffer to hold formatted time string
+
+        strftime(time_buffer, sizeof(time_buffer), "timestamp: %a, %d %b %Y %T %z\n", tm_info); // Format time string
+
+        int file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+        if(file_fd == -1){
+            err = errno;
+            syslog(LOG_ERR, "Opening output file for timestamp failed: %s\n", strerror(err));
+            break;
+        }
+
+        pthread_mutex_lock(&file_mutex);
+        if(write(file_fd, time_buffer, strlen(time_buffer)) == -1){
+            err = errno;
+            syslog(LOG_ERR, "Writing timestamp to file failed: %s\n", strerror(err));
+            close(file_fd);
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+
+        close(file_fd);
+        pthread_mutex_unlock(&file_mutex);
+        // Sleep for 10 seconds, checking active flag each second for improved responsiveness
+        for(int i = 0; i < 10; i++){
+            if(!active){
+                break;
+            }
+            sleep(1);
+        }   
+    }
+    return NULL;
+}
+
 int main(int argc, char* argv[]){
     int server_fd, err;
     openlog(NULL, 0, LOG_USER);
+
+    // Initialize mutexes without attributes (null)
+    pthread_mutex_init(&file_mutex, NULL);
+    pthread_mutex_init(&list_mutex, NULL);
+
+    // Initialize the head of the thread pool linked list
+    SLIST_INIT(&head);
 
     // Catching signals and providing special handling for terminations and interrupts
     struct sigaction action;
     memset(&action, 0, sizeof(struct sigaction));
     action.sa_handler = signal_handler;
     sigemptyset(&action.sa_mask);  // Clear signal mask
-    action.sa_flags = 0;            // No special flags
+    action.sa_flags = 0;           // No special flags
 
     if(sigaction(SIGINT, &action, NULL) == -1){
         syslog(LOG_ERR, "Failed to set SIGINT handler");
@@ -272,29 +363,46 @@ int main(int argc, char* argv[]){
         syslog(LOG_ERR, "Failed to set SIGTERM handler");
     }
 
-    // Setup server socket
-    server_fd = setup_server();
-    if(server_fd == -1){
+    // Start stamper thread to add timestamps to output file every 10 seconds
+    pthread_t stamper_thread;
+    if( (pthread_create(&stamper_thread, NULL, stamper_handler, NULL)) != 0){
+        err = errno;
+        syslog(LOG_ERR, "Stamper thread creation failed: %s\n", strerror(err));
+        pthread_mutex_destroy(&file_mutex);
+        pthread_mutex_destroy(&list_mutex);
         closelog();
         return -1;
     }
-    syslog(LOG_DEBUG, "Server socket file descriptor: %d", server_fd);
+
+    // Setup server socket
+    server_fd = setup_server();
+    if(server_fd == -1){
+        pthread_mutex_destroy(&file_mutex);
+        pthread_mutex_destroy(&list_mutex);
+        closelog();
+        return -1;
+    }
 
     // If argumnet '-d' is provided to program, listen for connections as a daemon
     if ( (argc > 1) && (strcmp(argv[1], "-d") == 0)){
         pid_t pid;
 
         pid = fork();
-
         if(pid ==  -1){
             err = errno;
             syslog(LOG_ERR, "Daemon process fork failed: %s\n", strerror(err));
+            close(server_fd);
+            pthread_mutex_destroy(&file_mutex);
+            pthread_mutex_destroy(&list_mutex);
+            closelog();
             exit(EXIT_FAILURE);
         }else if (pid == 0){
             syslog(LOG_DEBUG, "Running as daemon process");
             if( (setsid()) == -1 ){
                 err = errno;
                 syslog(LOG_ERR, "Creating new session for daemon failed: %s\n", strerror(err));
+                pthread_mutex_destroy(&file_mutex);
+                pthread_mutex_destroy(&list_mutex);
                 close(server_fd);
                 closelog();
                 return -1;
@@ -303,6 +411,8 @@ int main(int argc, char* argv[]){
             if( (chdir("/")) == -1 ){
                 err = errno;
                 syslog(LOG_ERR, "Changing working directory for daemon failed: %s\n", strerror(err));
+                pthread_mutex_destroy(&file_mutex);
+                pthread_mutex_destroy(&list_mutex);
                 close(server_fd);
                 closelog();
                 return -1;
@@ -317,9 +427,11 @@ int main(int argc, char* argv[]){
     }
 
     // Listen for incoming connections
-    if( (listen(server_fd, 10)) == -1 ){
+    if( (listen(server_fd, BACKLOG)) == -1 ){
         err = errno;
         syslog(LOG_ERR, "Listening for incoming connections failed: %s\n", strerror(err));
+        pthread_mutex_destroy(&file_mutex);
+        pthread_mutex_destroy(&list_mutex);
         close(server_fd);
         closelog();
         return -1;
@@ -328,53 +440,67 @@ int main(int argc, char* argv[]){
 
     // Start requesting connection request until signal is detected
     while(active){
-        int client_fd, file_fd;
-        char client_ip[INET6_ADDRSTRLEN];
+        int client_fd;
+        struct thread_data *new_client;
 
-        // Setting up client connection and return client IP address
-        client_fd = client_handler(server_fd, client_ip);
+        // Setting up client connection
+        client_fd = client_setup(server_fd);
         if(client_fd == -1){
             if(!active){
                 break; // Exit loop if signal was caught
             }
-            continue;
+            continue; //If this connection failed, try for another request
         }
-        syslog(LOG_DEBUG, "Client file descriptor: %d", client_fd);
-        
-        // Open output file for writing received data, or create it if it doesn't exist
-        file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-        if(file_fd == -1){
+
+        // Start handling client connection
+        new_client = malloc(sizeof(struct thread_data));
+        if(new_client == NULL){
             err = errno;
-            syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
-            close(server_fd);
+            syslog(LOG_ERR, "Memory allocation for thread data failed: %s\n", strerror(err));
             close(client_fd);
-            closelog();
-            return -1;
+            continue; //If this connection failed, try for another request
         }
-
-        // Receive data packets from client and write to file immediately
-        if( (receive_data(client_fd, file_fd)) == -1 ){
-            close(file_fd);
+        
+        // Create new thread to handle each individual client and add to linked list
+        new_client->client_fd = client_fd;
+        new_client->thread_complete = 0;
+        if( (pthread_create(&new_client->thread_id, NULL, client_handler, new_client)) != 0){
+            err = errno;
+            syslog(LOG_ERR, "Thread creation failed: %s\n", strerror(err));
             close(client_fd);
-            close(server_fd);
-            closelog();
-            return -1;
+            free(new_client);
+            continue; //If this connection failed, try for another request
         }
+        SLIST_INSERT_HEAD(&head, new_client, thread_pool);
 
-        // Send back data saved in output file to client
-        if( (send_data(client_fd, file_fd)) == -1 ){
-            close(file_fd);
-            close(client_fd);
-            close(server_fd);
-            closelog();
-            return -1;
+        // Join thread if status is complete, remove from list and free memory
+        pthread_mutex_lock(&list_mutex);
+        struct thread_data *current_client,*temp_client;
+        SLIST_FOREACH_SAFE(current_client, &head, thread_pool, temp_client){
+            if(current_client->thread_complete == 1){
+                pthread_join(current_client->thread_id, NULL);
+                SLIST_REMOVE(&head, current_client, thread_data, thread_pool);
+                free(current_client);
+            }
         }
-
-        // Log closed connection with client IP
-        syslog(LOG_DEBUG, "Closed connection from %s", client_ip);
-        close(file_fd); // Close output file after writing is done
-        close(client_fd); // Close client connection after data transfer is done
+        pthread_mutex_unlock(&list_mutex);
     }
+
+    // Clean up remaining client threads once server shutdowm signal is received
+    pthread_mutex_lock(&list_mutex);
+    while(!SLIST_EMPTY(&head)){
+        struct thread_data *temp_thread = SLIST_FIRST(&head);
+        pthread_join(temp_thread->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&head, thread_pool);
+        free(temp_thread);
+    }
+    pthread_mutex_unlock(&list_mutex);
+
+    // Wait for stamper thread to finish
+    pthread_join(stamper_thread, NULL);
+
+    pthread_mutex_destroy(&file_mutex);
+    pthread_mutex_destroy(&list_mutex);
     
     close(server_fd);
     syslog(LOG_DEBUG, "Server socket closed");
