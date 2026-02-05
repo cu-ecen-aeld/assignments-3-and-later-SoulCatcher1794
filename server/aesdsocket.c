@@ -305,9 +305,9 @@ void *stamper_handler(void *args){
     while(active){
         time_t now = time(NULL); // Get current time
         struct tm *tm_info = localtime(&now); // Convert to local time structure
-        char time_buffer[64]; // Buffer to hold formatted time string
+        char time_buffer[512]; // Buffer to hold formatted time string
 
-        strftime(time_buffer, sizeof(time_buffer), "timestamp: %a, %d %b %Y %T %z\n", tm_info); // Format time string
+        strftime(time_buffer, sizeof(time_buffer), "timestamp:%a, %d %b %Y %T %z\n", tm_info); // Format time string
 
         int file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
         if(file_fd == -1){
@@ -327,6 +327,7 @@ void *stamper_handler(void *args){
 
         close(file_fd);
         pthread_mutex_unlock(&file_mutex);
+
         // Sleep for 10 seconds, checking active flag each second for improved responsiveness
         for(int i = 0; i < 10; i++){
             if(!active){
@@ -335,6 +336,7 @@ void *stamper_handler(void *args){
             sleep(1);
         }   
     }
+
     return NULL;
 }
 
@@ -361,17 +363,6 @@ int main(int argc, char* argv[]){
     }
     if(sigaction(SIGTERM, &action, NULL) == -1){
         syslog(LOG_ERR, "Failed to set SIGTERM handler");
-    }
-
-    // Start stamper thread to add timestamps to output file every 10 seconds
-    pthread_t stamper_thread;
-    if( (pthread_create(&stamper_thread, NULL, stamper_handler, NULL)) != 0){
-        err = errno;
-        syslog(LOG_ERR, "Stamper thread creation failed: %s\n", strerror(err));
-        pthread_mutex_destroy(&file_mutex);
-        pthread_mutex_destroy(&list_mutex);
-        closelog();
-        return -1;
     }
 
     // Setup server socket
@@ -424,6 +415,18 @@ int main(int argc, char* argv[]){
         }else if(pid > 0){
             exit(EXIT_SUCCESS);
         }
+    }
+
+    // Start stamper thread to add timestamps to output file every 10 seconds
+    pthread_t stamper_thread;
+    if( (pthread_create(&stamper_thread, NULL, stamper_handler, NULL)) != 0){
+        err = errno;
+        syslog(LOG_ERR, "Stamper thread creation failed: %s\n", strerror(err));
+        pthread_mutex_destroy(&file_mutex);
+        pthread_mutex_destroy(&list_mutex);
+        close(server_fd);
+        closelog();
+        return -1;
     }
 
     // Listen for incoming connections
