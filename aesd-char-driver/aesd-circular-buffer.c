@@ -58,7 +58,7 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     /**
     * TODO: implement per description
     */
-   int index = buffer->in_offs;
+   size_t index = buffer->in_offs;
 
    if(buffer->full == true){
     buffer->out_offs = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
@@ -66,10 +66,10 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
 
    buffer->entry[index] = *add_entry;
 
-   buffer->in_offs = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+   buffer->in_offs = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 
    // Verify if circular buffer still has empty slots
-   if(!(buffer->full) && (index == AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)){
+   if(!(buffer->full) && (buffer->in_offs == buffer->out_offs)){
     buffer->full = true;
    }
 }
