@@ -132,9 +132,9 @@ int client_setup(int server_fd){
 }
 
 // Function to receive data from client and write to file
-int receive_data(int client_fd, int file_fd){
+int receive_data(int client_fd){
     // Define variables for data packet buffer
-    int err;
+    int err, file_fd;
     int buf_size = 1024; //Start with 1kb for buffer size
     char *buf = malloc(buf_size);
     int packet_size = 0;
@@ -159,18 +159,29 @@ int receive_data(int client_fd, int file_fd){
             int packet_length = (newline_pos - buf) + 1; // Calculate length of complete packet (buffer size - position of newline + 1 to include newline)
             int bytes_written = 0; // Track number of bytes written to file
 
+            // Open output file for writing only when data is ready to be written
+            file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+            if(file_fd == -1){
+                err = errno;
+                syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
+                free(buf);
+                return -1;
+            }
+
             pthread_mutex_lock(&file_mutex); // Lock file for writing
             while(bytes_written < packet_length){
                 int result = write(file_fd, (buf + bytes_written), (packet_length - bytes_written));
                 if(result == -1){
                     err = errno;
                     syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
+                    close(file_fd);
                     free(buf);
                     pthread_mutex_unlock(&file_mutex); // Unlock file after writing attempt
                     return -1; // Exit with error
                 }
                 bytes_written += result;
             }
+            close(file_fd); // Close file after writing
             free(buf); // Free buffer memory
             pthread_mutex_unlock(&file_mutex); // Unlock file after writing to file
             return 0; // Packet fully received and written to file
@@ -207,8 +218,8 @@ int receive_data(int client_fd, int file_fd){
 }
 
 // Function to send data from file back to client
-int send_data(int client_fd, int file_fd){
-    int err, bytes_read;
+int send_data(int client_fd){
+    int err, file_fd, bytes_read;
     int buf_size = 1024;
     char *buf = malloc(buf_size);
 
@@ -219,10 +230,20 @@ int send_data(int client_fd, int file_fd){
         return -1;
     }
 
+    // Open output file for reading only when data is ready to be sent
+    file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if(file_fd == -1){
+        err = errno;
+        syslog(LOG_ERR, "Opening output file for reading failed: %s\n", strerror(err));
+        free(buf);
+        return -1;
+    }
+
     // Seek to beginning of file to read complete content
     if( (lseek(file_fd, 0, SEEK_SET) == -1) ){
         err = errno;
         syslog(LOG_ERR, "File seek failed: %s\n", strerror(err));
+        close(file_fd);
         free(buf);
         return -1;
     }
@@ -237,6 +258,7 @@ int send_data(int client_fd, int file_fd){
             if(sent == -1){
                 err = errno;
                 syslog(LOG_ERR, "Sending data to client failed: %s\n", strerror(err));
+                close(file_fd);
                 free(buf);
                 pthread_mutex_unlock(&file_mutex); // Unlock file after sending attempt
                 return -1;
@@ -249,10 +271,12 @@ int send_data(int client_fd, int file_fd){
     if(bytes_read == -1){
         err = errno;
         syslog(LOG_ERR, "Reading from file failed: %s\n", strerror(err));
+        close(file_fd);
         free(buf);
         return -1;
     }
 
+    close(file_fd); // Close file after reading
     free(buf);
     return 0;
 }
@@ -261,24 +285,10 @@ int send_data(int client_fd, int file_fd){
 void *client_handler(void *args){
     struct thread_data *data = (struct thread_data *)args;
     int client_fd = data->client_fd;
-    int file_fd, err;
-
-    // Open output file for writing received data, or create it if it doesn't exist
-    file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if(file_fd == -1){
-        err = errno;
-        syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
-        close(client_fd);
-        pthread_mutex_lock(&list_mutex);
-        data->thread_complete = 1;
-        pthread_mutex_unlock(&list_mutex);
-        pthread_exit(NULL);
-    }
 
     // Receive data packets from client and write to file immediately
-    if( (receive_data(client_fd, file_fd)) == -1 ){
+    if( (receive_data(client_fd)) == -1 ){
         close(client_fd);
-        close(file_fd);
         pthread_mutex_lock(&list_mutex);
         data->thread_complete = 1;
         pthread_mutex_unlock(&list_mutex);
@@ -286,16 +296,14 @@ void *client_handler(void *args){
     }
 
     // Send back data saved in output file to client
-    if( (send_data(client_fd, file_fd)) == -1 ){
+    if( (send_data(client_fd)) == -1 ){
         close(client_fd);
-        close(file_fd);
         pthread_mutex_lock(&list_mutex);
         data->thread_complete = 1;
         pthread_mutex_unlock(&list_mutex);
         pthread_exit(NULL);
     }
 
-    close(file_fd); // Close output file after writing is done
     close(client_fd); // Close client connection after data transfer is done
 
     pthread_mutex_lock(&list_mutex);
