@@ -19,8 +19,13 @@
 
 #define PORT "9000"
 #define BACKLOG 10
-#define OUTPUT_FILE "/var/tmp/aesdsocketdata"
-
+#define USE_AESD_CHAR_DEVICE 1 // Comment to disable write to driver
+/* Build switch to select write to output file or driver */
+#ifdef USE_AESD_CHAR_DEVICE
+    #define OUTPUT_FILE "/dev/aesdchar"
+#else
+    #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
+#endif
 // Global variables
 static volatile sig_atomic_t active = 1;
 
