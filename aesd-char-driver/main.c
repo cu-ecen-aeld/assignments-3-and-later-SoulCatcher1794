@@ -54,7 +54,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     struct aesd_dev *dev = filp->private_data;
 
     /* Lock while reading */
-    if (mutex_lock_interruptible(dev->mutex)){
+    if (mutex_lock_interruptible(&dev->mutex)){
         /* 
             Kernel will either restart the call or return error to the user.
             Should undo any user-visible changes that might have been made.
@@ -66,7 +66,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     PDEBUG("Data locked with mutex, reading operation");
     
     /* Find entry that matches byte offset position or return NULL if none was found */
-    entry = aesd_circular_buffer_find_entry_offset_for_fpos(dev->buffer, *f_pos, &entry_offset);
+    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_offset);
     /* Verify if there's an existing entry in that position, otherwise return 0 */
     if(entry != NULL){
         /* Figure out how many bytes are left to read of the entry after offset */
@@ -93,7 +93,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     
     exit:
     /* Unlock data */
-    mutex_unlock(dev->mutex);
+    mutex_unlock(&dev->mutex);
     return retval;
 }
 
@@ -105,7 +105,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     struct aesd_dev *dev = filp->private_data;
 
     /* Lock when writting */
-    if(mutex_lock_interruptible(dev->mutex)){
+    if(mutex_lock_interruptible(&dev->mutex)){
         return -ERESTARTSYS;
     }
 
@@ -139,7 +139,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 
     /* If new_line character was found, save into circular buffer */
     if(memchr(dev->entry.buffptr, '\n', new_size)){
-        aesd_circular_buffer_add_entry(dev->buffer, dev->entry);
+        aesd_circular_buffer_add_entry(&dev->buffer, &dev->entry);
         dev->entry.buffptr = NULL;
         dev->entry.size = 0;
     }
@@ -148,7 +148,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     retval = count;
 
     exit:
-    mutex_unlock(dev->mutex);
+    mutex_unlock(&dev->mutex);
     return retval;
 }
 
@@ -195,10 +195,10 @@ int aesd_init_module(void){
     mutex_init(&aesd_device.mutex);
 
     // Initilize aesd_device
-    result = aesd_setup_cdev(&aesd_device);  
+    result = aesd_setup_cdev(&aesd_device);
 
     if( result ) {
-        mutex_destroy(aesd_device.mutex);
+        mutex_destroy(&aesd_device.mutex);
         unregister_chrdev_region(dev, 1);
     }
     return result;
