@@ -304,6 +304,7 @@ void *client_handler(void *args){
     return NULL;
 }
 
+#ifndef USE_AESD_CHAR_DEVICE
 void *stamper_handler(void *args){
     int err;
 
@@ -344,6 +345,7 @@ void *stamper_handler(void *args){
 
     return NULL;
 }
+#endif
 
 int main(int argc, char* argv[]){
     int server_fd, err;
@@ -422,7 +424,9 @@ int main(int argc, char* argv[]){
         }
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Start stamper thread to add timestamps to output file every 10 seconds
+    
     pthread_t stamper_thread;
     if( (pthread_create(&stamper_thread, NULL, stamper_handler, NULL)) != 0){
         err = errno;
@@ -433,6 +437,7 @@ int main(int argc, char* argv[]){
         closelog();
         return -1;
     }
+#endif
 
     // Listen for incoming connections
     if( (listen(server_fd, BACKLOG)) == -1 ){
@@ -504,8 +509,10 @@ int main(int argc, char* argv[]){
     }
     pthread_mutex_unlock(&list_mutex);
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Wait for stamper thread to finish
     pthread_join(stamper_thread, NULL);
+#endif
 
     pthread_mutex_destroy(&file_mutex);
     pthread_mutex_destroy(&list_mutex);
@@ -513,6 +520,7 @@ int main(int argc, char* argv[]){
     close(server_fd);
     syslog(LOG_DEBUG, "Server socket closed");
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Delete the output file
     if(unlink(OUTPUT_FILE) == -1){
         err = errno;
@@ -520,6 +528,7 @@ int main(int argc, char* argv[]){
             syslog(LOG_ERR, "Failed to delete output file: %s\n", strerror(err));
         }
     }
+#endif
 
     closelog();
     return 0;
