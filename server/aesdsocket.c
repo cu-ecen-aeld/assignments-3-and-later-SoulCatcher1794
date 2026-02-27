@@ -20,12 +20,14 @@
 #define PORT "9000"
 #define BACKLOG 10
 #define USE_AESD_CHAR_DEVICE 1 // Comment to disable write to driver
+
 /* Build switch to select write to output file or driver */
 #ifdef USE_AESD_CHAR_DEVICE
     #define OUTPUT_FILE "/dev/aesdchar"
 #else
     #define OUTPUT_FILE "/var/tmp/aesdsocketdata"
 #endif
+
 // Global variables
 static volatile sig_atomic_t active = 1;
 
@@ -219,15 +221,19 @@ int send_data(int client_fd, int file_fd){
         return -1;
     }
 
+    pthread_mutex_lock(&file_mutex); // Lock file/device for seek+read
+
+#ifndef USE_AESD_CHAR_DEVICE
     // Seek to beginning of file to read complete content
     if( (lseek(file_fd, 0, SEEK_SET) == -1) ){
         err = errno;
         syslog(LOG_ERR, "File seek failed: %s\n", strerror(err));
+        pthread_mutex_unlock(&file_mutex);
         free(buf);
         return -1;
     }
+#endif
 
-    pthread_mutex_lock(&file_mutex); // Lock file for reading
     // Read and send data from file in chunks
     while( (bytes_read = read(file_fd, buf, buf_size)) > 0 ){
         int total_sent = 0;
@@ -263,8 +269,12 @@ void *client_handler(void *args){
     int client_fd = data->client_fd;
     int file_fd, err;
 
-    // Open output file for writing received data, or create it if it doesn't exist
+    // Open output target (char device vs regular file)
+#ifdef USE_AESD_CHAR_DEVICE
+    file_fd = open(OUTPUT_FILE, O_RDWR);
+#else
     file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+#endif
     if(file_fd == -1){
         err = errno;
         syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
@@ -285,6 +295,21 @@ void *client_handler(void *args){
         pthread_exit(NULL);
     }
 
+#ifdef USE_AESD_CHAR_DEVICE
+    // Char device may not support llseek; reopen for read so position starts at 0
+    close(file_fd);
+    file_fd = open(OUTPUT_FILE, O_RDONLY);
+    if(file_fd == -1){
+        err = errno;
+        syslog(LOG_ERR, "Opening output file for read failed: %s\n", strerror(err));
+        close(client_fd);
+        pthread_mutex_lock(&list_mutex);
+        data->thread_complete = 1;
+        pthread_mutex_unlock(&list_mutex);
+        pthread_exit(NULL);
+    }
+#endif
+
     // Send back data saved in output file to client
     if( (send_data(client_fd, file_fd)) == -1 ){
         close(client_fd);
@@ -304,6 +329,7 @@ void *client_handler(void *args){
     return NULL;
 }
 
+#ifndef USE_AESD_CHAR_DEVICE
 void *stamper_handler(void *args){
     int err;
 
@@ -344,6 +370,7 @@ void *stamper_handler(void *args){
 
     return NULL;
 }
+#endif
 
 int main(int argc, char* argv[]){
     int server_fd, err;
@@ -422,6 +449,7 @@ int main(int argc, char* argv[]){
         }
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Start stamper thread to add timestamps to output file every 10 seconds
     pthread_t stamper_thread;
     if( (pthread_create(&stamper_thread, NULL, stamper_handler, NULL)) != 0){
@@ -433,6 +461,7 @@ int main(int argc, char* argv[]){
         closelog();
         return -1;
     }
+#endif
 
     // Listen for incoming connections
     if( (listen(server_fd, BACKLOG)) == -1 ){
@@ -504,8 +533,10 @@ int main(int argc, char* argv[]){
     }
     pthread_mutex_unlock(&list_mutex);
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Wait for stamper thread to finish
     pthread_join(stamper_thread, NULL);
+#endif
 
     pthread_mutex_destroy(&file_mutex);
     pthread_mutex_destroy(&list_mutex);
@@ -513,6 +544,7 @@ int main(int argc, char* argv[]){
     close(server_fd);
     syslog(LOG_DEBUG, "Server socket closed");
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Delete the output file
     if(unlink(OUTPUT_FILE) == -1){
         err = errno;
@@ -520,6 +552,7 @@ int main(int argc, char* argv[]){
             syslog(LOG_ERR, "Failed to delete output file: %s\n", strerror(err));
         }
     }
+#endif
 
     closelog();
     return 0;

@@ -4,12 +4,11 @@ device=aesdchar
 mode="664"
 cd `dirname $0`
 set -e
-# Group: since distributions do it differently, look for wheel or use staff
-if grep -q '^staff:' /etc/group; then
-    group="staff"
-else
-    group="wheel"
-fi
+
+# Prefer the primary group of the user invoking sudo so non-root tests can open
+# /dev/aesdchar with O_RDWR. Fallback to the current user's primary group.
+owner_user="${SUDO_USER:-$USER}"
+group=$(id -gn "$owner_user" 2>/dev/null || id -gn)
 
 if [ -e ${module}.ko ]; then
     echo "Loading local built file ${module}.ko"
