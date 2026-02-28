@@ -152,12 +152,59 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     return retval;
 }
 
+ssize_t aesd_seek(struct file *filp, loff_t off, int whence){
+    struct aesd_dev *dev = filp->private_data;
+    loff_t newpos;
+
+    if(mutex_lock_interruptible(&dev->mutex)){
+        return -ERESTARTSYS;
+    }
+
+    switch(whence){
+        case 0: /* SEEK_SET */
+            newpos = off;
+            break;
+        case 1: /* SEEK_CUR */
+            newpos = filp->f_pos + off;
+            break;
+        case 2: /* SEEK_END */
+            newpos = aesd_circular_buffer_calculate_size(&dev->buffer) + off;
+            break;
+        default: /* Invalid argument */
+            mutex_unlock(&dev->mutex);
+            return -EINVAL;
+    }
+
+    if (newpos < 0){
+        mutex_unlock(&dev->mutex);
+        return -EINVAL;
+    }
+
+    filp->f_pos = newpos;
+    mutex_unlock(&dev->mutex);
+    return newpos;
+}
+
+long aesd_ioct(struct file *filp, unsigned int cmd, unsingned long arg){
+    struct aesd_dev dev = filp->f_inode->i_private;
+
+    switch(cmd){
+        case AESDCHAR_IOCSEEKTO:
+            /* To do*/
+            break;
+        case default
+    }
+
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .unlocked_ioctl = aesd_ioct,
+    .llseek = 
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev){

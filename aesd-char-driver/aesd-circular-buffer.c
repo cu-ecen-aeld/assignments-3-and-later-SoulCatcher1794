@@ -16,6 +16,18 @@
 
 #include "aesd-circular-buffer.h"
 
+loff_t aesd_circular_buffer_calculate_size(struct aesd_circular_buffer *buffer){
+    size_t total_size = 0;
+    size_t count = buffer->full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED : buffer->in_offs;
+
+    for(size_t i = 0; i < count; i++){
+        size_t entry_pos = (buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        total_size += entry[entry_pos].size;
+    }
+
+    return total_size;
+}
+
 /**
  * @param buffer the buffer to search for corresponding offset.  Any necessary locking must be performed by caller.
  * @param char_offset the position to search for in the buffer list, describing the zero referenced
