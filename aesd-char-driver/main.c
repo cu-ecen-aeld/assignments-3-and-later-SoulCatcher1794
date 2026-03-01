@@ -146,6 +146,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 
     /* Return bytes saved on the entry (count) */
     retval = count;
+    *f_pos += count;
 
     exit:
     mutex_unlock(&dev->mutex);
@@ -155,6 +156,8 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 ssize_t aesd_seek(struct file *filp, loff_t off, int whence){
     struct aesd_dev *dev = filp->private_data;
     loff_t newpos;
+
+    PDEBUG("seek offset %lld whence %d", off, whence);
 
     if(mutex_lock_interruptible(&dev->mutex)){
         return -ERESTARTSYS;
@@ -181,8 +184,13 @@ ssize_t aesd_seek(struct file *filp, loff_t off, int whence){
     }
 
     filp->f_pos = newpos;
+    PDEBUG("seek complete, new position %lld", newpos);
     mutex_unlock(&dev->mutex);
     return newpos;
+}
+
+static long aesd_adjust_file_offset(struct file *flip, unsigned int write_cmd, unsigned int write_cmd_offset){
+    /*To do*/
 }
 
 long aesd_ioct(struct file *filp, unsigned int cmd, unsingned long arg){
@@ -190,11 +198,15 @@ long aesd_ioct(struct file *filp, unsigned int cmd, unsingned long arg){
 
     switch(cmd){
         case AESDCHAR_IOCSEEKTO:
-            /* To do*/
+            struct aesd_seekto seekto;
+            if ( copy_from_user(&seekto, (const void __user*)arg, sizeof(seekto)) != 0 ){
+                return -EINVAL;
+            }else{
+                retval = aesd_adjust_file_offset
+            }
             break;
         case default
     }
-
 }
 
 struct file_operations aesd_fops = {
@@ -204,7 +216,7 @@ struct file_operations aesd_fops = {
     .open =     aesd_open,
     .release =  aesd_release,
     .unlocked_ioctl = aesd_ioct,
-    .llseek = 
+    .llseek = aesd_seek,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev){

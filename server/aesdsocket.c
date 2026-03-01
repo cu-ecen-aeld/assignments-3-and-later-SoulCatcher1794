@@ -15,7 +15,9 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/ioctl.h>
 #include "queue.h"
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #define PORT "9000"
 #define BACKLOG 10
@@ -149,11 +151,27 @@ int receive_data(int client_fd){
         return -1;
     }
 
-    // Keep receiving data until client closes connection
+    // Keep receiving data until client closes connection 
     while(active && ((bytes_received = recv(client_fd, (buf+packet_size), (buf_size-packet_size-1), 0)) > 0)){
+        /* Define variables in case ioctl function is called */
+        char *command;
+        struct aesd_seekto *seekto = malloc(sizeof(struct aesd_seekto));
+        memset(seekto, 0, sizeof(struct aesd_seekto));
+
         packet_size += bytes_received; // Add bytes read to total packet size
         buf[packet_size] = '\0'; // End buffer with the null character
         
+        if( sscanf(buf, "%21[^:]:%d,%d", command, &seekto->write_cmd, &seekto->write_cmd_offset) ){
+            if( strcmp(command, "AESDCHAR_IOCSEEKTO") == 0 ){
+                int fd = fileno(OUTPUT_FILE);
+                if ( ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) < 0){
+                    err = errno;
+                    syslog(LOG_ERR, "ioctl function could not be performed: %s\n", strerror(err));
+                }
+                continue;
+            }
+        }
+
         // Check if we have a complete packet (newline found)
         newline_pos = strchr(buf, '\n');
         // Found new line character which indicates a single packet has been completely recieved
