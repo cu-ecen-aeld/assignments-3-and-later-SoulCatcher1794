@@ -40,9 +40,7 @@ loff_t aesd_circular_buffer_calculate_size(struct aesd_circular_buffer *buffer){
  */
 struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn ){
-    /**
-    * TODO: implement per description
-    */
+
     size_t remaining = char_offset;
     size_t count = buffer->full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED : buffer->in_offs;
     

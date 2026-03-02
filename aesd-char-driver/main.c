@@ -189,24 +189,67 @@ ssize_t aesd_seek(struct file *filp, loff_t off, int whence){
     return newpos;
 }
 
-static long aesd_adjust_file_offset(struct file *flip, unsigned int write_cmd, unsigned int write_cmd_offset){
-    /*To do*/
+static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, unsigned int write_cmd_offset){
+    struct aesd_dev *dev = filp->private_data;
+    long retval = 0;
+    size_t count;
+    size_t entry_pos_off;
+    loff_t cmd_offset = 0;
+    unsigned int index;
+
+    if(mutex_lock_interruptible(&dev->mutex)){
+        return -ERESTARTSYS;
+    }
+
+    /* Determine total number of entries saved inside circular buffer */
+    count = dev->buffer.full ? AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED : dev->buffer.in_offs;
+    
+    /* If write_cmd exceeds total number of entries, return invalid argument */
+    if(write_cmd >= count){
+        retval = -EINVAL;
+        goto out;
+    }
+    
+    /* Find write command according to offset */
+    entry_pos_off = (dev->buffer.out_offs + write_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    
+    /* If write_cmd_offset exceeds entry size, return invalid argument */
+    if (write_cmd_offset >= dev->buffer.entry[entry_pos_off].size){
+        retval = -EINVAL;
+        goto out;
+    }
+
+    for(index = 0; index < write_cmd; index++){
+        size_t cmd_index = (dev->buffer.out_offs + index) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        cmd_offset += dev->buffer.entry[cmd_index].size;
+    }
+    
+    filp->f_pos = cmd_offset + write_cmd_offset;
+
+    out:
+    mutex_unlock(&dev->mutex);
+    return retval;
 }
 
-long aesd_ioct(struct file *filp, unsigned int cmd, unsingned long arg){
-    struct aesd_dev dev = filp->f_inode->i_private;
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
+    long retval = 0;
 
     switch(cmd){
         case AESDCHAR_IOCSEEKTO:
             struct aesd_seekto seekto;
-            if ( copy_from_user(&seekto, (const void __user*)arg, sizeof(seekto)) != 0 ){
-                return -EINVAL;
+
+            if ( copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)) != 0 ){
+                return -EFAULT;
             }else{
-                retval = aesd_adjust_file_offset
+                retval = aesd_adjust_file_offset(filp, seekto.write_cmd, seekto.write_cmd_offset);
             }
             break;
-        case default
+
+        default:
+            return -ENOTTY;
     }
+
+    return retval;
 }
 
 struct file_operations aesd_fops = {
@@ -215,7 +258,7 @@ struct file_operations aesd_fops = {
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
-    .unlocked_ioctl = aesd_ioct,
+    .unlocked_ioctl = aesd_ioctl,
     .llseek = aesd_seek,
 };
 
