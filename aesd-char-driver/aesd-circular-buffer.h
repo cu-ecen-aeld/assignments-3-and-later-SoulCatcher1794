@@ -20,34 +20,22 @@
 
 struct aesd_buffer_entry
 {
-    /**
-     * A location where the buffer contents in buffptr are stored
-     */
+    /* A location where the buffer contents in buffptr are stored */
     const char *buffptr;
-    /**
-     * Number of bytes stored in buffptr
-     */
+    /* Number of bytes stored in buffptr */
     size_t size;
 };
 
 struct aesd_circular_buffer
 {
-    /**
-     * An array of pointers to memory allocated for the most recent write operations
-     */
+    
+    /* An array of pointers to memory allocated for the most recent write operations */
     struct aesd_buffer_entry  entry[AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED];
-    /**
-     * The current location in the entry structure where the next write should
-     * be stored.
-     */
+    /* The current location in the entry structure where the next write should be stored. */
     uint8_t in_offs;
-    /**
-     * The first location in the entry structure to read from
-     */
+    /* The first location in the entry structure to read from */
     uint8_t out_offs;
-    /**
-     * set to true when the buffer entry structure is full
-     */
+    /* Set to true when the buffer entry structure is full */
     bool full;
 };
 
