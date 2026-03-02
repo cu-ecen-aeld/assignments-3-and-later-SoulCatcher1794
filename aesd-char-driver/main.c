@@ -27,7 +27,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
-int aesd_open(struct inode *inode, struct file *filp){
+static int aesd_open(struct inode *inode, struct file *filp){
     PDEBUG("open");
 
     struct aesd_dev *dev; // Device information
@@ -37,13 +37,13 @@ int aesd_open(struct inode *inode, struct file *filp){
     return 0;
 }
 
-int aesd_release(struct inode *inode, struct file *filp){
+static int aesd_release(struct inode *inode, struct file *filp){
     PDEBUG("release");
     /*No need to deallocate anything here, everything to be handles at cleaup function*/
     return 0;
 }
 
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos){
+static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos){
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
 
     ssize_t retval = 0;
@@ -97,7 +97,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     return retval;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos){
+static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos){
     ssize_t retval = -ENOMEM;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
@@ -125,7 +125,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     dev->entry.buffptr = tmp;
 
     /* Copy string from user space and save in working entry at the last character written (current_size) */
-    if(copy_from_user( (dev->entry.buffptr + current_size), buf, count)){
+    if(copy_from_user((void *)(dev->entry.buffptr + current_size), buf, count)){
         /* If copy fails, free memory of buffptr, point to NULL and set size as 0 */
         kfree(dev->entry.buffptr);
         dev->entry.buffptr = NULL;
@@ -153,7 +153,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     return retval;
 }
 
-ssize_t aesd_seek(struct file *filp, loff_t off, int whence){
+static loff_t aesd_seek(struct file *filp, loff_t off, int whence){
     struct aesd_dev *dev = filp->private_data;
     loff_t newpos;
 
@@ -231,7 +231,7 @@ static long aesd_adjust_file_offset(struct file *filp, unsigned int write_cmd, u
     return retval;
 }
 
-long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
+static long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
     long retval = 0;
 
     switch(cmd){
@@ -278,7 +278,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev){
     return err;
 }
 
-int aesd_init_module(void){
+static int aesd_init_module(void){
     dev_t dev = 0; // Variable to hold device numbers (both major and minor parts)
     int result; // Variable used to hold function outputs
 
@@ -307,7 +307,7 @@ int aesd_init_module(void){
 
 }
 
-void aesd_cleanup_module(void){
+static void aesd_cleanup_module(void){
     dev_t devno = MKDEV(aesd_major, aesd_minor);
     /* Remove char device from the system */
     cdev_del(&aesd_device.cdev);

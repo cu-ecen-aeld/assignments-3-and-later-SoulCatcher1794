@@ -9,9 +9,11 @@
  */
 
 #ifdef __KERNEL__
-#include <linux/string.h>
+    #include <linux/string.h>
+    #include <linux/types.h>
 #else
-#include <string.h>
+    #include <string.h>
+    #include <stddef.h>
 #endif
 
 #include "aesd-circular-buffer.h"
@@ -22,7 +24,7 @@ loff_t aesd_circular_buffer_calculate_size(struct aesd_circular_buffer *buffer){
 
     for(size_t i = 0; i < count; i++){
         size_t entry_pos = (buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-        total_size += entry[entry_pos].size;
+        total_size += buffer->entry[entry_pos].size;
     }
 
     return total_size;

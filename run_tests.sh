@@ -38,11 +38,14 @@ case $1 in
     "assignment8")
         sudo "${AUTOTEST_DIR}/assignment8/sockettest.sh"
         ;;
+    "assignment9")
+        sudo "${AUTOTEST_DIR}/assignment9/sockettest.sh"
+        ;;
     "drivertest")
-        sudo "${AUTOTEST_DIR}/assignment8/drivertest.sh"
+        sudo "${AUTOTEST_DIR}/assignment9/drivertest.sh"
         ;;
     *)
-        echo "Usage: $0 {assignment6|assignment8|drivertest}"
+        echo "Usage: $0 {assignment6|assignment8|assignment9|drivertest}"
         exit 1
         ;;
 esac
