@@ -136,7 +136,7 @@ int client_setup(int server_fd){
 }
 
 // Function to receive data from client and write to file/device
-int receive_data(int client_fd){
+int receive_data(int client_fd, int file_fd){
     // Define variables for data packet buffer
     int err;
     int buf_size = 1024; //Start with 1kb for buffer size
@@ -144,6 +144,8 @@ int receive_data(int client_fd){
     int packet_size = 0;
     int bytes_received;
     char *newline_pos = NULL;
+    struct aesd_seekto *seekto = NULL;
+
 
     if(buf == NULL){
         err = errno;
@@ -153,65 +155,89 @@ int receive_data(int client_fd){
 
     // Keep receiving data until client closes connection 
     while(active && ((bytes_received = recv(client_fd, (buf+packet_size), (buf_size-packet_size-1), 0)) > 0)){
-        /* Define variables in case ioctl function is called */
-        char *command;
-        struct aesd_seekto *seekto = malloc(sizeof(struct aesd_seekto));
-        memset(seekto, 0, sizeof(struct aesd_seekto));
-
         packet_size += bytes_received; // Add bytes read to total packet size
         buf[packet_size] = '\0'; // End buffer with the null character
         
-        if( sscanf(buf, "%21[^:]:%d,%d", command, &seekto->write_cmd, &seekto->write_cmd_offset) ){
-            if( strcmp(command, "AESDCHAR_IOCSEEKTO") == 0 ){
-                int fd = fileno(OUTPUT_FILE);
-                if ( ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) < 0){
-                    err = errno;
-                    syslog(LOG_ERR, "ioctl function could not be performed: %s\n", strerror(err));
-                }
-                continue;
-            }
-        }
-
         // Check if we have a complete packet (newline found)
         newline_pos = strchr(buf, '\n');
+
         // Found new line character which indicates a single packet has been completely recieved
         if(newline_pos != NULL){
             int packet_length = (newline_pos - buf) + 1; // Calculate length of complete packet (buffer size - position of newline + 1 to include newline)
             int bytes_written = 0; // Track number of bytes written to file
-            int file_fd;
+            
+            /* Define variables in case ioctl function is called */
+            char command[22];  // Buffer for command string (21 chars + null terminator)
+            seekto = malloc(sizeof(struct aesd_seekto));
 
-#ifdef USE_AESD_CHAR_DEVICE
-            file_fd = open(OUTPUT_FILE, O_WRONLY);
-#else
-            file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
-#endif
-            if(file_fd == -1){
+            /* Error handling for seekto memory allocation */
+            if(seekto == NULL){
                 err = errno;
-                syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
+                syslog(LOG_ERR, "Memory allocation for seekto failed: %s\n", strerror(err));
                 free(buf);
                 return -1;
             }
+            
+            /* If seekto structure is correctly allocated, then set it to 0*/
+            memset(seekto, 0, sizeof(struct aesd_seekto));
 
-            pthread_mutex_lock(&file_mutex); // Lock file/device for writing
+            /* Review if AESDCHAR_IOCSEEKTO instruction was sent over the socket */
+            if( sscanf(buf, "%21[^:]:%d,%d", command, &seekto->write_cmd, &seekto->write_cmd_offset) ){
+                if( strcmp(command, "AESDCHAR_IOCSEEKTO") == 0 ){
+                    /* Lock file/device for seek operation in circular buffer */
+                    pthread_mutex_lock(&file_mutex);
+
+                    /* Review if ioctl found any error */
+                    if ( ioctl(file_fd, AESDCHAR_IOCSEEKTO, &seekto) < 0 ){
+                        err = errno;
+                        syslog(LOG_ERR, "ioctl function could not be performed: %s\n", strerror(err));
+                        pthread_mutex_unlock(&file_mutex);
+                        free(seekto);
+                        free(buf);
+                        return -1;
+                    }
+
+                    /* Once done, release locks and reset buffers and packet_size */
+                    pthread_mutex_unlock(&file_mutex);
+                    packet_size = 0;
+                    memset(seekto, 0, sizeof(struct aesd_seekto));
+                    memset(buf, 0, buf_size);
+
+                    /* Look for another packet to be sent, do not write to file */
+                    continue;
+                }
+            }
+
+            /* Lock file/device for writing */ 
+            pthread_mutex_lock(&file_mutex); 
+
+            /* Write to output file if there's no ioctl function send */
             while(bytes_written < packet_length){
                 int result = write(file_fd, (buf + bytes_written), (packet_length - bytes_written));
+                
+                /* In case file write fails */
                 if(result == -1){
                     err = errno;
                     syslog(LOG_ERR, "Writing to file failed: %s\n", strerror(err));
+                    pthread_mutex_unlock(&file_mutex);
+                    free(seekto);
                     free(buf);
-                    close(file_fd);
-                    pthread_mutex_unlock(&file_mutex); // Unlock file after writing attempt
                     return -1; // Exit with error
                 }
+
+                /* Add result to bytes written to review if buffer was fully written to file */
                 bytes_written += result;
             }
-            close(file_fd);
-            free(buf); // Free buffer memory
-            pthread_mutex_unlock(&file_mutex); // Unlock file after writing to file
-            return 0; // Packet fully received and written to file
-        } 
+            
+            /* Once done, release locks and reset buffers and packet_size */
+            pthread_mutex_unlock(&file_mutex); 
+            packet_size = 0;
+            memset(seekto, 0, sizeof(struct aesd_seekto));
+            memset(buf, 0, buf_size);
+            continue;
+        }
 
-        // Increase buffer size if needed and no packet complete yet
+        /* Increase buffer size ONLY if more memory is needed and packet is still incomplete */
         if(packet_size >= (buf_size-1)){
             buf_size *= 2; //Double buffer size
             char *temp = realloc(buf, buf_size); // Reallocate buffer variable with new buffer size
@@ -235,14 +261,15 @@ int receive_data(int client_fd){
         return -1;
     }
 
-    // Client closed connection, finalize data reception and 
+    // Client closed connection, finalize data reception
     syslog(LOG_DEBUG, "Data reception from client finalized");
     free(buf); // Free buffer memory of unwritten data of last packet
+    
     return 0;
 }
 
 // Function to send data from file/device back to client
-int send_data(int client_fd){
+int send_data(int client_fd, int file_fd){
     int err, bytes_read;
     int buf_size = 1024;
     char *buf = malloc(buf_size);
@@ -252,18 +279,6 @@ int send_data(int client_fd){
     if(buf == NULL){
         err = errno;
         syslog(LOG_ERR, "Memory allocation failed: %s\n", strerror(err));
-        return -1;
-    }
-
-#ifdef USE_AESD_CHAR_DEVICE
-    file_fd = open(OUTPUT_FILE, O_RDONLY);
-#else
-    file_fd = open(OUTPUT_FILE, O_RDONLY);
-#endif
-    if(file_fd == -1){
-        err = errno;
-        syslog(LOG_ERR, "Opening output file for read failed: %s\n", strerror(err));
-        free(buf);
         return -1;
     }
 
@@ -302,12 +317,10 @@ int send_data(int client_fd){
     if(bytes_read == -1){
         err = errno;
         syslog(LOG_ERR, "Reading from file failed: %s\n", strerror(err));
-        close(file_fd);
         free(buf);
         return -1;
     }
 
-    close(file_fd);
     free(buf);
     return 0;
 }
@@ -316,9 +329,28 @@ int send_data(int client_fd){
 void *client_handler(void *args){
     struct thread_data *data = (struct thread_data *)args;
     int client_fd = data->client_fd;
+    int file_fd, err;
+
+    // Open file/device for this client
+    #ifdef USE_AESD_CHAR_DEVICE
+    file_fd = open(OUTPUT_FILE, O_RDWR);
+    #else
+    file_fd = open(OUTPUT_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    #endif
+
+    if(file_fd == -1){
+        err = errno;
+        syslog(LOG_ERR, "Opening output file failed: %s\n", strerror(err));
+        close(client_fd);
+        pthread_mutex_lock(&list_mutex);
+        data->thread_complete = 1;
+        pthread_mutex_unlock(&list_mutex);
+        pthread_exit(NULL);
+    }
 
     // Receive data packets from client and write to file immediately
-    if( (receive_data(client_fd)) == -1 ){
+    if( (receive_data(client_fd, file_fd)) == -1 ){
+        close(file_fd);
         close(client_fd);
         pthread_mutex_lock(&list_mutex);
         data->thread_complete = 1;
@@ -327,7 +359,8 @@ void *client_handler(void *args){
     }
 
     // Send back data saved in output file to client
-    if( (send_data(client_fd)) == -1 ){
+    if( (send_data(client_fd, file_fd)) == -1 ){
+        close(file_fd);
         close(client_fd);
         pthread_mutex_lock(&list_mutex);
         data->thread_complete = 1;
@@ -335,6 +368,7 @@ void *client_handler(void *args){
         pthread_exit(NULL);
     }
 
+    close(file_fd); // Close file/device
     close(client_fd); // Close client connection after data transfer is done
 
     pthread_mutex_lock(&list_mutex);
